@@ -1,0 +1,252 @@
+#pragma kernel UpdateParticles1
+#pragma kernel UpdateParticles2
+#pragma kernel ApplyCollisions
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SHARED STRUCTURES (matches CPU side exactly)
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct GPUParticle
+{
+    float3 position;
+    float3 prevPosition;
+    float3 restLocalPosition;
+    float damping;
+    float elasticity;
+    float stiffness;
+    float inert;
+    float radius;
+    float boneLength;
+    int parentIndex;
+    int transformIndex;
+    int padding;
+};
+
+struct GPUCollider
+{
+    float3 center;
+    float radius;
+    float3 normal;
+    int type;  // 0=sphere, 1=capsule, 2=plane
+};
+
+struct GPUWorldCollider
+{
+    float3 center;
+    float3 scale;
+    float3 normal;
+    int type;  // 0=plane, 1=box, 2=capsule
+    int padding;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONSTANT BUFFERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+cbuffer SimParams : register(b0)
+{
+    float3 gravity;
+    float deltaTime;
+    float3 force;
+    float objectScale;
+    float3 objectMove;
+    float weight;
+    int particleCount;
+    int colliderCount;
+    int worldColliderCount;
+    int freezeAxis;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STRUCTURED BUFFERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+RWStructuredBuffer<GPUParticle> particles : register(u0);
+StructuredBuffer<GPUCollider> colliders : register(t0);
+StructuredBuffer<GPUWorldCollider> worldColliders : register(t1);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UTILITY FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+float3 SafeNormalize(float3 v)
+{
+    float len = length(v);
+    return len > 0.0001 ? v / len : float3(0, 0, 0);
+}
+
+float3 PlaneNormal(float3 center, float3 normal, float3 worldUp)
+{
+    float3 right = cross(normal, worldUp);
+    if (length(right) < 0.001)
+        right = cross(normal, float3(0, 0, 1));
+    right = normalize(right);
+    float3 up = cross(right, normal);
+    return normalize(up);
+}
+
+bool SphereCollide(inout float3 pos, float3 sphereCenter, float radius, float particleRadius)
+{
+    float3 delta = pos - sphereCenter;
+    float dist = length(delta);
+    float minDist = radius + particleRadius;
+    
+    if (dist < minDist && dist > 0.0001)
+    {
+        pos = sphereCenter + (delta / dist) * minDist;
+        return true;
+    }
+    return false;
+}
+
+bool PlaneCollide(inout float3 pos, float3 planeCenter, float3 planeNormal, float particleRadius)
+{
+    float3 delta = pos - planeCenter;
+    float dist = dot(delta, planeNormal);
+    
+    if (dist < particleRadius)
+    {
+        pos += planeNormal * (particleRadius - dist);
+        return true;
+    }
+    return false;
+}
+
+bool BoxCollide(inout float3 pos, float3 boxCenter, float3 boxSize, float particleRadius)
+{
+    float3 localPos = pos - boxCenter;
+    float3 halfSize = boxSize * 0.5 + particleRadius;
+    float3 dists = abs(localPos) - halfSize;
+    
+    if (dists.x < 0 && dists.y < 0 && dists.z < 0)
+    {
+        if (dists.x > dists.y && dists.x > dists.z)
+            pos.x = boxCenter.x + halfSize.x * sign(localPos.x);
+        else if (dists.y > dists.x && dists.y > dists.z)
+            pos.y = boxCenter.y + halfSize.y * sign(localPos.y);
+        else
+            pos.z = boxCenter.z + halfSize.z * sign(localPos.z);
+        return true;
+    }
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KERNEL: UpdateParticles1 - Verlet integration step 1
+// ─────────────────────────────────────────────────────────────────────────────
+
+[numthreads(256, 1, 1)]
+void UpdateParticles1(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+    
+    GPUParticle p = particles[id.x];
+    
+    // Root particle stays locked
+    if (p.parentIndex < 0)
+        return;
+    
+    // Verlet: v = pos - prevPos
+    float3 velocity = p.position - p.prevPosition;
+    
+    // Apply forces
+    float3 totalForce = gravity + force;
+    totalForce *= objectScale;
+    
+    // Inertia from object movement
+    float3 rmove = objectMove * p.inert;
+    
+    // Update position
+    float3 newPrevPos = p.position + rmove;
+    float3 newPos = p.position + velocity * (1.0 - p.damping) + totalForce + rmove;
+    
+    p.position = newPos;
+    p.prevPosition = newPrevPos;
+    particles[id.x] = p;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KERNEL: UpdateParticles2 - Constraint solving step 2
+// ─────────────────────────────────────────────────────────────────────────────
+
+[numthreads(256, 1, 1)]
+void UpdateParticles2(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < 1 || id.x >= particleCount) return;
+    
+    GPUParticle p = particles[id.x];
+    GPUParticle p0 = particles[p.parentIndex];
+    
+    // Elasticity: pull toward rest position
+    float3 restPos = p.restLocalPosition;
+    float3 delta = restPos - p.position;
+    p.position += delta * p.elasticity;
+    
+    // Stiffness: limit stretch
+    float stiff = lerp(1.0, p.stiffness, weight);
+    if (stiff > 0.0)
+    {
+        delta = restPos - p.position;
+        float len = length(delta);
+        float maxlen = p.boneLength * (1.0 - stiff) * 2.0;
+        if (len > maxlen && len > 0.0001)
+        {
+            p.position += delta * ((len - maxlen) / len);
+        }
+    }
+    
+    // Distance constraint: keep parent-child distance
+    float3 parentDelta = p0.position - p.position;
+    float parentDist = length(parentDelta);
+    if (parentDist > 0.0001)
+    {
+        p.position += parentDelta * ((parentDist - p.boneLength) / parentDist);
+    }
+    
+    // Freeze axis
+    if (freezeAxis > 0)
+    {
+        float3 axis = float3(0, 0, 0);
+        if (freezeAxis == 1) axis = float3(1, 0, 0);
+        else if (freezeAxis == 2) axis = float3(0, 1, 0);
+        else if (freezeAxis == 3) axis = float3(0, 0, 1);
+        
+        float3 parentToChild = p.position - p0.position;
+        float projLen = dot(parentToChild, axis);
+        p.position -= axis * projLen;
+    }
+    
+    particles[id.x] = p;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KERNEL: ApplyCollisions - Resolve collisions
+// ─────────────────────────────────────────────────────────────────────────────
+
+[numthreads(256, 1, 1)]
+void ApplyCollisions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < 1 || id.x >= particleCount) return;
+    
+    GPUParticle p = particles[id.x];
+    float pr = p.radius * objectScale;
+    
+    // Internal Character Colliders
+    for (int i = 0; i < colliderCount; i++)
+    {
+        GPUCollider c = colliders[i];
+        if (c.type == 0) SphereCollide(p.position, c.center, c.radius, pr);
+        else if (c.type == 2) PlaneCollide(p.position, c.center, c.normal, pr);
+    }
+    
+    // Global World Colliders
+    for (int j = 0; j < worldColliderCount; j++)
+    {
+        GPUWorldCollider wc = worldColliders[j];
+        if (wc.type == 0) PlaneCollide(p.position, wc.center, wc.normal, pr);
+        else if (wc.type == 1) BoxCollide(p.position, wc.center, wc.scale, pr);
+        else if (wc.type == 2) SphereCollide(p.position, wc.center, wc.scale.x, pr);
+    }
+    
+    particles[id.x] = p;
+}

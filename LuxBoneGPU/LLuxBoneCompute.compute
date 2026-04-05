@@ -1,0 +1,362 @@
+#pragma kernel UpdateParticles1
+#pragma kernel UpdateParticles2
+#pragma kernel ApplyCollisions
+#pragma kernel AudioReactive
+
+// ───────────────────────────────────────────────────────────────────────────
+//  PARTICLE STRUCTURE (matches CPU-side)
+// ───────────────────────────────────────────────────────────────────────────
+struct Particle
+{
+    float3 position;
+    float3 prevPosition;
+    float3 force;
+    float damping;
+    float elasticity;
+    float stiffness;
+    float inert;
+    float radius;
+    float4 restPosition;  // xyz = restPos, w = restLength
+    int parentIndex;
+    int transformIndex;
+    float pad0;
+    float pad1;
+};
+
+struct ColliderData
+{
+    float3 center;
+    float radius;
+    int type; // 0=sphere, 1=capsule, 2=plane
+    int bound; // 0=outside, 1=inside
+    float2 pad;
+};
+
+struct WindZoneData
+{
+    float3 position;
+    float radius;
+    float3 windDirection;
+    float windStrength;
+    float windFrequency;
+    float windTurbulence;
+    float blendWeight;
+    int shapeType; // 0=sphere, 1=box, 2=infinite
+    float3 boxSize;
+    float softEdgeInfluence;
+    int priority;
+    float pad;
+};
+
+struct AudioReactiveData
+{
+    float bassFrequency;
+    float midFrequency;
+    float trebleFrequency;
+    float overallAmplitude;
+    float audioInfluence;
+};
+
+// ───────────────────────────────────────────────────────────────────────────
+//  CBUFFERS (Constant Buffers)
+// ───────────────────────────────────────────────────────────────────────────
+cbuffer SimulationParams : register(b0)
+{
+    float3 gravity;
+    float deltaTime;
+    float3 force;
+    float objectScale;
+    float3 objectMove;
+    float weight;
+    int particleCount;
+    int pad0;
+    int pad1;
+    int pad2;
+};
+
+cbuffer CollisionParams : register(b1)
+{
+    int colliderCount;
+    int windZoneCount;
+    int maxWorldColliders;
+    int freezeAxis; // 0=none, 1=x, 2=y, 3=z
+};
+
+cbuffer AudioParams : register(b2)
+{
+    float audioInfluence;
+    float audioFrequencyScale;
+    float audioTurbulenceScale;
+    float audioWindScale;
+};
+
+// ───────────────────────────────────────────────────────────────────────────
+//  STRUCTURED BUFFERS (RW = Read-Write)
+// ───────────────────────────────────────────────────────────────────────────
+RWStructuredBuffer<Particle> particles : register(u0);
+StructuredBuffer<ColliderData> colliders : register(t0);
+StructuredBuffer<WindZoneData> windZones : register(t1);
+RWStructuredBuffer<AudioReactiveData> audioData : register(u1);
+
+// Per-particle constraint data for distance constraints
+RWStructuredBuffer<float4> constraints : register(u2); // xyz=delta, w=restLen
+
+// ───────────────────────────────────────────────────────────────────────────
+//  UTILITY FUNCTIONS
+// ───────────────────────────────────────────────────────────────────────────
+
+// Pseudo-random number generator (used for noise)
+float rand(float2 co)
+{
+    return frac(sin(dot(co, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+// Simple Perlin-like noise for wind turbulence
+float noise2D(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+    
+    float a = rand(i);
+    float b = rand(i + float2(1.0, 0.0));
+    float c = rand(i + float2(0.0, 1.0));
+    float d = rand(i + float2(1.0, 1.0));
+    
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+// Distance to plane
+float distanceToPlane(float3 pos, float3 planeCenter, float3 planeNormal)
+{
+    return dot(pos - planeCenter, planeNormal);
+}
+
+// Evaluate dominant wind zone at position
+void EvaluateWindZone(float3 worldPos, out float3 outWind, out float outInfluence)
+{
+    outWind = float3(0, 0, 0);
+    outInfluence = 0.0;
+    int dominantZone = -1;
+    int dominantPriority = -999999;
+    
+    for (int i = 0; i < windZoneCount; i++)
+    {
+        WindZoneData z = windZones[i];
+        float dist = length(worldPos - z.position);
+        float influence = 0.0;
+        bool contains = false;
+        
+        if (z.shapeType == 0) // Sphere
+        {
+            if (dist <= z.radius)
+            {
+                contains = true;
+                influence = z.softEdgeInfluence > 0.5 
+                    ? max(0.0, 1.0 - dist / z.radius)
+                    : 1.0;
+            }
+        }
+        else if (z.shapeType == 2) // Infinite
+        {
+            contains = true;
+            influence = 1.0;
+        }
+        
+        if (contains && z.priority >= dominantPriority)
+        {
+            dominantZone = i;
+            dominantPriority = z.priority;
+            outInfluence = influence;
+        }
+    }
+    
+    if (dominantZone >= 0)
+    {
+        WindZoneData z = windZones[dominantZone];
+        float t = (z.windFrequency * 123.456); // Simplified time reference
+        float noise = sin(t) * 0.5 + 0.5; // Oscillate noise
+        float combined = lerp(noise, sin(t * 2.1 + 17.3), z.windTurbulence);
+        
+        outWind = normalize(z.windDirection) * z.windStrength 
+                * (1.0 + combined * z.windTurbulence) * objectScale 
+                * z.blendWeight * outInfluence;
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  KERNEL: UpdateParticles1
+//  Verlet integration step 1: velocity + forces
+// ───────────────────────────────────────────────────────────────────────────
+[numthreads(256, 1, 1)]
+void UpdateParticles1(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= particleCount) return;
+    
+    Particle p = particles[id.x];
+    
+    // Root particle (parent=-1) stays locked to transform
+    if (p.parentIndex < 0) return;
+    
+    // Evaluate wind at this position
+    float3 windForce;
+    float windInfluence;
+    EvaluateWindZone(p.position, windForce, windInfluence);
+    
+    // Apply gravity and forces
+    float3 totalForce = gravity + force + windForce;
+    totalForce *= objectScale;
+    
+    // Verlet: v = pos - prevPos, so new prevPos = pos + v*(1-damping)
+    float3 v = p.position - p.prevPosition;
+    float3 rmove = objectMove * p.inert;
+    
+    float3 newPrevPos = p.position + rmove;
+    float3 newPos = p.position + v * (1.0 - p.damping) + totalForce + rmove;
+    
+    particles[id.x].position = newPos;
+    particles[id.x].prevPosition = newPrevPos;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  KERNEL: UpdateParticles2
+//  Constraint solving: elasticity, stiffness, length constraints
+// ───────────────────────────────────────────────────────────────────────────
+[numthreads(256, 1, 1)]
+void UpdateParticles2(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < 1 || id.x >= particleCount) return; // Skip root
+    
+    Particle p = particles[id.x];
+    Particle p0 = particles[p.parentIndex];
+    
+    float4 constraint = constraints[id.x];
+    float3 restPos = constraint.xyz;
+    float restLen = constraint.w;
+    
+    // Elasticity
+    float3 d = restPos - p.position;
+    p.position += d * p.elasticity;
+    
+    // Stiffness
+    float stiffness = lerp(1.0, p.stiffness, weight);
+    if (stiffness > 0.0)
+    {
+        d = restPos - p.position;
+        float len = length(d);
+        float maxlen = restLen * (1.0 - stiffness) * 2.0;
+        if (len > maxlen && len > 0.0001)
+        {
+            p.position += d * ((len - maxlen) / len);
+        }
+    }
+    
+    // Distance constraint (keep length)
+    float3 dd = p0.position - p.position;
+    float leng = length(dd);
+    if (leng > 0.0001)
+    {
+        p.position += dd * ((leng - restLen) / leng);
+    }
+    
+    // Freeze axis constraint
+    if (freezeAxis > 0)
+    {
+        float3 normal = float3(0, 0, 0);
+        if (freezeAxis == 1) normal = float3(1, 0, 0); // X
+        else if (freezeAxis == 2) normal = float3(0, 1, 0); // Y
+        else if (freezeAxis == 3) normal = float3(0, 0, 1); // Z
+        
+        float dist = dot(p.position - p0.position, normal);
+        p.position -= normal * dist;
+    }
+    
+    particles[id.x] = p;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  KERNEL: ApplyCollisions
+//  Sphere and capsule collision resolution
+// ───────────────────────────────────────────────────────────────────────────
+[numthreads(256, 1, 1)]
+void ApplyCollisions(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < 1 || id.x >= particleCount) return;
+    
+    Particle p = particles[id.x];
+    float pr = p.radius * objectScale;
+    
+    // Test against all colliders
+    for (int i = 0; i < colliderCount; i++)
+    {
+        ColliderData c = colliders[i];
+        
+        if (c.type == 0) // Sphere
+        {
+            float3 d = p.position - c.center;
+            float dist = length(d);
+            float r = c.radius + pr;
+            
+            if (c.bound == 0) // Outside (normal)
+            {
+                if (dist < r && dist > 0.0001)
+                {
+                    p.position = c.center + normalize(d) * r;
+                }
+            }
+            else // Inside (reverse)
+            {
+                if (dist > r)
+                {
+                    p.position = c.center + normalize(d) * r;
+                }
+            }
+        }
+        else if (c.type == 1) // Capsule
+        {
+            // Simplified capsule: treat as sphere at center
+            float3 d = p.position - c.center;
+            float dist = length(d);
+            float r = c.radius + pr;
+            if (dist < r && dist > 0.0001)
+            {
+                p.position = c.center + normalize(d) * r;
+            }
+        }
+        else if (c.type == 2) // Plane
+        {
+            // Plane collision handled separately in CPU for normals
+        }
+    }
+    
+    particles[id.x] = p;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+//  KERNEL: AudioReactive
+//  Modulate wind, turbulence, and constraints based on audio
+// ───────────────────────────────────────────────────────────────────────────
+[numthreads(256, 1, 1)]
+void AudioReactive(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= windZoneCount) return;
+    
+    AudioReactiveData audio = audioData[0];
+    
+    // Modulate wind zone parameters based on audio frequencies
+    WindZoneData z = windZones[id.x];
+    
+    // Bass affects strength
+    z.windStrength *= (1.0 + audio.bassFrequency * audioWindScale);
+    
+    // Mid affects frequency oscillation
+    z.windFrequency *= (1.0 + audio.midFrequency * audioFrequencyScale);
+    
+    // Treble affects turbulence
+    z.windTurbulence = min(1.0, z.windTurbulence + audio.trebleFrequency * audioTurbulenceScale);
+    
+    // Overall amplitude affects zone influence
+    z.softEdgeInfluence *= (1.0 + audio.overallAmplitude * audioInfluence);
+    
+    windZones[id.x] = z;
+}
